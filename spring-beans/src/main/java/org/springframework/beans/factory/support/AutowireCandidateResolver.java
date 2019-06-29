@@ -1,11 +1,11 @@
 /*
- * Copyright 2002-2017 the original author or authors.
+ * Copyright 2002-2018 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,6 +18,7 @@ package org.springframework.beans.factory.support;
 
 import org.springframework.beans.factory.config.BeanDefinitionHolder;
 import org.springframework.beans.factory.config.DependencyDescriptor;
+import org.springframework.lang.Nullable;
 
 /**
  * Strategy interface for determining whether a specific bean definition
@@ -57,6 +58,20 @@ public interface AutowireCandidateResolver {
 	}
 
 	/**
+	 * Determine whether the given descriptor declares a qualifier beyond the type
+	 * (typically - but not necessarily - a specific kind of annotation).
+	 * <p>The default implementation returns {@code false}.
+	 * @param descriptor the descriptor for the target method parameter or field
+	 * @return whether the descriptor declares a qualifier, narrowing the candidate
+	 * status beyond the type match
+	 * @since 5.1
+	 * @see org.springframework.beans.factory.annotation.QualifierAnnotationAutowireCandidateResolver#hasQualifier
+	 */
+	default boolean hasQualifier(DependencyDescriptor descriptor) {
+		return false;
+	}
+
+	/**
 	 * Determine whether a default value is suggested for the given dependency.
 	 * <p>The default implementation simply returns {@code null}.
 	 * @param descriptor the descriptor for the target method parameter or field
@@ -64,6 +79,7 @@ public interface AutowireCandidateResolver {
 	 * or {@code null} if none found
 	 * @since 3.0
 	 */
+	@Nullable
 	default Object getSuggestedValue(DependencyDescriptor descriptor) {
 		return null;
 	}
@@ -78,7 +94,8 @@ public interface AutowireCandidateResolver {
 	 * or {@code null} if straight resolution is to be performed
 	 * @since 4.0
 	 */
-	default Object getLazyResolutionProxyIfNecessary(DependencyDescriptor descriptor, String beanName) {
+	@Nullable
+	default Object getLazyResolutionProxyIfNecessary(DependencyDescriptor descriptor, @Nullable String beanName) {
 		return null;
 	}
 

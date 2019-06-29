@@ -1,11 +1,11 @@
 /*
- * Copyright 2002-2017 the original author or authors.
+ * Copyright 2002-2019 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,15 +20,18 @@ import java.security.Principal;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.i18n.LocaleContext;
 import org.springframework.core.ResolvableType;
+import org.springframework.core.codec.Hints;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
@@ -39,6 +42,7 @@ import org.springframework.http.codec.ServerCodecConfigurer;
 import org.springframework.http.codec.multipart.Part;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.lang.Nullable;
 import org.springframework.util.Assert;
 import org.springframework.util.CollectionUtils;
 import org.springframework.util.LinkedMultiValueMap;
@@ -46,10 +50,8 @@ import org.springframework.util.MultiValueMap;
 import org.springframework.util.StringUtils;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.server.WebSession;
+import org.springframework.web.server.i18n.LocaleContextResolver;
 import org.springframework.web.server.session.WebSessionManager;
-
-import static org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED;
-import static org.springframework.http.MediaType.MULTIPART_FORM_DATA;
 
 /**
  * Default implementation of {@link ServerWebExchange}.
@@ -61,11 +63,10 @@ public class DefaultServerWebExchange implements ServerWebExchange {
 
 	private static final List<HttpMethod> SAFE_METHODS = Arrays.asList(HttpMethod.GET, HttpMethod.HEAD);
 
-	private static final ResolvableType FORM_DATA_VALUE_TYPE =
+	private static final ResolvableType FORM_DATA_TYPE =
 			ResolvableType.forClassWithGenerics(MultiValueMap.class, String.class, String.class);
 
-	private static final ResolvableType MULTIPART_VALUE_TYPE = ResolvableType.forClassWithGenerics(
-			MultiValueMap.class, String.class, Part.class);
+	private static final ResolvableType PARTS_DATA_TYPE = ResolvableType.forClass(Part.class);
 
 	private static final Mono<MultiValueMap<String, String>> EMPTY_FORM_DATA =
 			Mono.just(CollectionUtils.unmodifiableMultiValueMap(new LinkedMultiValueMap<String, String>(0)))
@@ -84,47 +85,69 @@ public class DefaultServerWebExchange implements ServerWebExchange {
 
 	private final Mono<WebSession> sessionMono;
 
+	private final LocaleContextResolver localeContextResolver;
+
 	private final Mono<MultiValueMap<String, String>> formDataMono;
 
 	private final Mono<MultiValueMap<String, Part>> multipartDataMono;
 
+	private final Flux<Part> partFlux;
+
+	@Nullable
+	private final ApplicationContext applicationContext;
+
 	private volatile boolean notModified;
 
+	private Function<String, String> urlTransformer = url -> url;
 
-	/**
-	 * Alternate constructor with a WebSessionManager parameter.
-	 */
+	@Nullable
+	private Object logId;
+
+	private String logPrefix = "";
+
+
 	public DefaultServerWebExchange(ServerHttpRequest request, ServerHttpResponse response,
-			WebSessionManager sessionManager, ServerCodecConfigurer codecConfigurer) {
+			WebSessionManager sessionManager, ServerCodecConfigurer codecConfigurer,
+			LocaleContextResolver localeContextResolver) {
+
+		this(request, response, sessionManager, codecConfigurer, localeContextResolver, null);
+	}
+
+	DefaultServerWebExchange(ServerHttpRequest request, ServerHttpResponse response,
+			WebSessionManager sessionManager, ServerCodecConfigurer codecConfigurer,
+			LocaleContextResolver localeContextResolver, @Nullable ApplicationContext applicationContext) {
 
 		Assert.notNull(request, "'request' is required");
 		Assert.notNull(response, "'response' is required");
 		Assert.notNull(sessionManager, "'sessionManager' is required");
 		Assert.notNull(codecConfigurer, "'codecConfigurer' is required");
+		Assert.notNull(localeContextResolver, "'localeContextResolver' is required");
+
+		// Initialize before first call to getLogPrefix()
+		this.attributes.put(ServerWebExchange.LOG_ID_ATTRIBUTE, request.getId());
 
 		this.request = request;
 		this.response = response;
 		this.sessionMono = sessionManager.getSession(this).cache();
-		this.formDataMono = initFormData(request, codecConfigurer);
-		this.multipartDataMono = initMultipartData(request, codecConfigurer);
+		this.localeContextResolver = localeContextResolver;
+		this.formDataMono = initFormData(request, codecConfigurer, getLogPrefix());
+		this.partFlux = initParts(request, codecConfigurer, getLogPrefix());
+		this.multipartDataMono = initMultipartData(this.partFlux);
+		this.applicationContext = applicationContext;
 	}
 
 	@SuppressWarnings("unchecked")
-	private static Mono<MultiValueMap<String, String>> initFormData(
-			ServerHttpRequest request, ServerCodecConfigurer codecConfigurer) {
+	private static Mono<MultiValueMap<String, String>> initFormData(ServerHttpRequest request,
+			ServerCodecConfigurer configurer, String logPrefix) {
 
-		MediaType contentType;
 		try {
-			contentType = request.getHeaders().getContentType();
-			if (APPLICATION_FORM_URLENCODED.isCompatibleWith(contentType)) {
-				return ((HttpMessageReader<MultiValueMap<String, String>>)codecConfigurer
-						.getReaders()
-						.stream()
-						.filter(reader -> reader.canRead(FORM_DATA_VALUE_TYPE, APPLICATION_FORM_URLENCODED))
+			MediaType contentType = request.getHeaders().getContentType();
+			if (MediaType.APPLICATION_FORM_URLENCODED.isCompatibleWith(contentType)) {
+				return ((HttpMessageReader<MultiValueMap<String, String>>) configurer.getReaders().stream()
+						.filter(reader -> reader.canRead(FORM_DATA_TYPE, MediaType.APPLICATION_FORM_URLENCODED))
 						.findFirst()
-						.orElseThrow(() -> new IllegalStateException(
-								"Could not find HttpMessageReader that supports " + APPLICATION_FORM_URLENCODED)))
-						.readMono(FORM_DATA_VALUE_TYPE, request, Collections.emptyMap())
+						.orElseThrow(() -> new IllegalStateException("No form data HttpMessageReader.")))
+						.readMono(FORM_DATA_TYPE, request, Hints.from(Hints.LOG_PREFIX_HINT, logPrefix))
 						.switchIfEmpty(EMPTY_FORM_DATA)
 						.cache();
 			}
@@ -136,30 +159,32 @@ public class DefaultServerWebExchange implements ServerWebExchange {
 	}
 
 	@SuppressWarnings("unchecked")
-	private static Mono<MultiValueMap<String, Part>> initMultipartData(
-			ServerHttpRequest request, ServerCodecConfigurer codecConfigurer) {
-
-		MediaType contentType;
+	private static Flux<Part> initParts(ServerHttpRequest request, ServerCodecConfigurer configurer, String logPrefix) {
 		try {
-			contentType = request.getHeaders().getContentType();
-			if (MULTIPART_FORM_DATA.isCompatibleWith(contentType)) {
-				return ((HttpMessageReader<MultiValueMap<String, Part>>) codecConfigurer
-						.getReaders()
-						.stream()
-						.filter(reader -> reader.canRead(MULTIPART_VALUE_TYPE, MULTIPART_FORM_DATA))
+			MediaType contentType = request.getHeaders().getContentType();
+			if (MediaType.MULTIPART_FORM_DATA.isCompatibleWith(contentType)) {
+				return ((HttpMessageReader<Part>)configurer.getReaders().stream()
+						.filter(reader -> reader.canRead(PARTS_DATA_TYPE, MediaType.MULTIPART_FORM_DATA))
 						.findFirst()
-						.orElseThrow(() -> new IllegalStateException(
-								"Could not find HttpMessageReader that supports " + MULTIPART_FORM_DATA)))
-						.readMono(FORM_DATA_VALUE_TYPE, request, Collections.emptyMap())
-						.switchIfEmpty(EMPTY_MULTIPART_DATA)
+						.orElseThrow(() -> new IllegalStateException("No multipart HttpMessageReader.")))
+						.read(PARTS_DATA_TYPE, request, Hints.from(Hints.LOG_PREFIX_HINT, logPrefix))
 						.cache();
 			}
 		}
 		catch (InvalidMediaTypeException ex) {
 			// Ignore
 		}
-		return EMPTY_MULTIPART_DATA;
+		return Flux.empty();
 	}
+
+	private static Mono<MultiValueMap<String, Part>> initMultipartData(Flux<Part> parts) {
+		return parts.collect(
+				() -> (MultiValueMap<String, Part>) new LinkedMultiValueMap<String, Part>(),
+				(map, part) -> map.add(part.name(), part))
+				.switchIfEmpty(EMPTY_MULTIPART_DATA)
+				.cache();
+	}
+
 
 
 	@Override
@@ -185,11 +210,6 @@ public class DefaultServerWebExchange implements ServerWebExchange {
 		return this.attributes;
 	}
 
-	@Override @SuppressWarnings("unchecked")
-	public <T> Optional<T> getAttribute(String name) {
-		return Optional.ofNullable((T) this.attributes.get(name));
-	}
-
 	@Override
 	public Mono<WebSession> getSession() {
 		return this.sessionMono;
@@ -211,6 +231,22 @@ public class DefaultServerWebExchange implements ServerWebExchange {
 	}
 
 	@Override
+	public Flux<Part> getParts() {
+		return this.partFlux;
+	}
+
+	@Override
+	public LocaleContext getLocaleContext() {
+		return this.localeContextResolver.resolveLocaleContext(this);
+	}
+
+	@Override
+	@Nullable
+	public ApplicationContext getApplicationContext() {
+		return this.applicationContext;
+	}
+
+	@Override
 	public boolean isNotModified() {
 		return this.notModified;
 	}
@@ -226,7 +262,7 @@ public class DefaultServerWebExchange implements ServerWebExchange {
 	}
 
 	@Override
-	public boolean checkNotModified(String etag, Instant lastModified) {
+	public boolean checkNotModified(@Nullable String etag, Instant lastModified) {
 		HttpStatus status = getResponse().getStatusCode();
 		if (this.notModified || (status != null && !HttpStatus.OK.equals(status))) {
 			return this.notModified;
@@ -243,7 +279,6 @@ public class DefaultServerWebExchange implements ServerWebExchange {
 		}
 
 		boolean validated = validateIfNoneMatch(etag);
-
 		if (!validated) {
 			validateIfModifiedSince(lastModified);
 		}
@@ -281,7 +316,7 @@ public class DefaultServerWebExchange implements ServerWebExchange {
 		return true;
 	}
 
-	private boolean validateIfNoneMatch(String etag) {
+	private boolean validateIfNoneMatch(@Nullable String etag) {
 		if (!StringUtils.hasLength(etag)) {
 			return false;
 		}
@@ -297,12 +332,19 @@ public class DefaultServerWebExchange implements ServerWebExchange {
 		}
 		// We will perform this validation...
 		etag = padEtagIfNecessary(etag);
-		for (String clientETag : ifNoneMatch) {
+		if (etag.startsWith("W/")) {
+			etag = etag.substring(2);
+		}
+		for (String clientEtag : ifNoneMatch) {
 			// Compare weak/strong ETags as per https://tools.ietf.org/html/rfc7232#section-2.3
-			if (StringUtils.hasLength(clientETag) &&
-					clientETag.replaceFirst("^W/", "").equals(etag.replaceFirst("^W/", ""))) {
-				this.notModified = true;
-				break;
+			if (StringUtils.hasLength(clientEtag)) {
+				if (clientEtag.startsWith("W/")) {
+					clientEtag = clientEtag.substring(2);
+				}
+				if (clientEtag.equals(etag)) {
+					this.notModified = true;
+					break;
+				}
 			}
 		}
 		return true;
@@ -329,6 +371,27 @@ public class DefaultServerWebExchange implements ServerWebExchange {
 		// We will perform this validation...
 		this.notModified = ChronoUnit.SECONDS.between(lastModified, Instant.ofEpochMilli(ifModifiedSince)) >= 0;
 		return true;
+	}
+
+	@Override
+	public String transformUrl(String url) {
+		return this.urlTransformer.apply(url);
+	}
+
+	@Override
+	public void addUrlTransformer(Function<String, String> transformer) {
+		Assert.notNull(transformer, "'encoder' must not be null");
+		this.urlTransformer = this.urlTransformer.andThen(transformer);
+	}
+
+	@Override
+	public String getLogPrefix() {
+		Object value = getAttribute(LOG_ID_ATTRIBUTE);
+		if (this.logId != value) {
+			this.logId = value;
+			this.logPrefix = value != null ? "[" + value + "] " : "";
+		}
+		return this.logPrefix;
 	}
 
 }
